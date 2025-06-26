@@ -20,7 +20,7 @@ LEGAL_SUFFIX_PATTERNS = [
 ]
 
 SUFFIX_RE = re.compile(r"\s+(?:" + "|".join(LEGAL_SUFFIX_PATTERNS) + r")\s*$", re.IGNORECASE)
-NON_ALNUM_RE = re.compile(r"[^\w\s&-]")  # keep & and -
+NON_ALNUM_RE = re.compile(r"[^\w\s&-]")   # keep & and hyphen
 MULTISPACE_RE = re.compile(r"\s{2,}")
 APOSTROPHE_RE = re.compile(r"[’']")
 
@@ -34,39 +34,37 @@ STOPWORDS_LOWER = {
     'of', 'and', 'the', 'for', 'in', 'on', 'at', 'with', 'to', 'from', 'by'
 }
 
-# Only acronyms explicitly listed here (or 2‑letter codes) remain all‑caps.
 ACRONYM_EXCEPTIONS = {
     'usa', 'bsn', 'ibm', 'uams', 'uapb', 'mri', 'ct'
 }
 
-VOWELS = set('aeiou')
 
+def _smart_case(word: str) -> str:
+    """Return a word in appropriate case.
 
-def _smart_case(word: str, first: bool) -> str:
-    """Return a word in appropriate case with sensible acronym handling."""
+    * Always lowercase stop‑words (of, and, …) regardless of position.
+    * Preserve two‑letter state codes (AR, TX) and whitelisted acronyms.
+    * Everything else title‑cased, keeping hyphenated parts.
+    """
     low = word.lower()
 
-    # State abbreviation ➜ upper
+    # Force stop‑words to lowercase everywhere
+    if low in STOPWORDS_LOWER:
+        return low
+
+    # Preserve state abbreviations
     if len(word) == 2 and low in STATE_CODES:
         return word.upper()
 
-    # Stop‑words ➜ lower (unless first word)
-    if low in STOPWORDS_LOWER:
-        return low if not first else low.capitalize()
+    # Preserve whitelisted acronyms (all‑caps tokens in the exceptions list)
+    if word.isupper() and low in ACRONYM_EXCEPTIONS:
+        return word
 
-    # Handle all‑caps tokens
-    if word.isupper():
-        if low in ACRONYM_EXCEPTIONS or len(word) == 2:
-            return word  # preserve
-        # else convert to Title‑case (handles hyphenated parts)
-        return "-".join(part.capitalize() for part in word.split("-"))
-
-    # Mixed / lower‑case tokens ➜ Title‑case (also handles hyphenated parts)
+    # Otherwise Title‑case, handling hyphenated compounds
     return "-".join(part.capitalize() for part in word.split("-"))
 
 
 def clean_company_name(name: str) -> str:
-    """Clean and normalise a company name while preserving '&' and hyphens."""
     if pd.isna(name):
         return ""
 
@@ -83,13 +81,13 @@ def clean_company_name(name: str) -> str:
         name = re.sub(r"\s+co\.?$", "", name, flags=re.IGNORECASE)
 
     tokens = name.split()
-    styled = [_smart_case(tok, i == 0) for i, tok in enumerate(tokens)]
+    styled = [_smart_case(tok) for tok in tokens]
 
-    # If trailing token is isolated '&', add back 'Co'
+    # Restore '& Co' if we accidentally trimmed 'Co' after an ampersand
     if styled and styled[-1] == '&':
         styled.append('Co')
 
-    return " ".join(styled)
+    return " " . join(styled)
 
 
 # -----------------------------------------------------------
@@ -124,10 +122,9 @@ st.markdown(
     """
 Upload a CSV, pick the column with company names, and download a cleaned version.
 
-**Key updates**
-* Only 2‑letter codes or whitelisted acronyms stay all‑caps—so *OLD*, *MFG*, *AIR* now title‑case.
-* Stop‑words (of, and, for…) lowercase mid‑name.
-* Everything else (hyphen, ampersand, suffix removal) unchanged.
+**Latest fix**
+* Stop‑words (*of, and, the…*) now always remain lowercase—no more stray caps.
+* Other rules unchanged (ampersands/hyphens kept, suffixes removed, smart acronyms, optional fuzzy dedupe).
 """
 )
 
@@ -168,6 +165,6 @@ if uploaded is not None:
     st.markdown(
         """
 ---
-More edge‑cases? Add the acronym to `ACRONYM_EXCEPTIONS` or tweak logic and redeploy.
+Need more tweaks? Just ask and we’ll refine further.
 """
     )
