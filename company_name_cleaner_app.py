@@ -7,11 +7,10 @@ from rapidfuzz import fuzz, process
 # -----------------------------------------------------------
 # Cleaning utilities
 # -----------------------------------------------------------
-# Regex‑ready suffixes that should be cut from the end of names
 LEGAL_SUFFIX_PATTERNS = [
     r'incorporated', r'inc\.?',
     r'llc', r'l\.l\.c\.?',
-    r'company', r'co\.?', r'corp\.?', r'corporation',
+    r'company', r'corp\.?', r'corporation',
     r'limited', r'ltd\.?', r'plc',
     r'gmbh', r's\.a\.?', r'bv', r'b\.v\.?', r'ag',
     # Professional / medical markers
@@ -21,8 +20,7 @@ LEGAL_SUFFIX_PATTERNS = [
 ]
 
 SUFFIX_RE = re.compile(r"\s+(?:" + "|".join(LEGAL_SUFFIX_PATTERNS) + r")\s*$", re.IGNORECASE)
-# Keep ampersand (&) so tokens like "H&H" survive. Hyphen kept initially, stripped later.
-NON_ALNUM_RE = re.compile(r"[^\w\s&-]")
+NON_ALNUM_RE = re.compile(r"[^\w\s&-]")  # keep & and -
 MULTISPACE_RE = re.compile(r"\s{2,}")
 APOSTROPHE_RE = re.compile(r"[’']")
 
@@ -32,36 +30,66 @@ STATE_CODES = {
     'oh', 'ok', 'or', 'pa', 'ri', 'sc', 'sd', 'tn', 'tx', 'ut', 'vt', 'va', 'wa', 'wv', 'wi', 'wy'
 }
 
+STOPWORDS_LOWER = {
+    'of', 'and', 'the', 'for', 'in', 'on', 'at', 'with', 'to', 'from', 'by'
+}
 
-def _smart_case(word: str) -> str:
-    """Return a word in a visually sensible case."""
+# Only acronyms explicitly listed here (or 2‑letter codes) remain all‑caps.
+ACRONYM_EXCEPTIONS = {
+    'usa', 'bsn', 'ibm', 'uams', 'uapb', 'mri', 'ct'
+}
+
+VOWELS = set('aeiou')
+
+
+def _smart_case(word: str, first: bool) -> str:
+    """Return a word in appropriate case with sensible acronym handling."""
+    low = word.lower()
+
+    # State abbreviation ➜ upper
+    if len(word) == 2 and low in STATE_CODES:
+        return word.upper()
+
+    # Stop‑words ➜ lower (unless first word)
+    if low in STOPWORDS_LOWER:
+        return low if not first else low.capitalize()
+
+    # Handle all‑caps tokens
     if word.isupper():
-        return word
-    if len(word) == 2 and word.lower() in STATE_CODES:
-        return word.upper()
-    if len(word) <= 3 and word.isalpha():
-        return word.upper()
-    return word.title()
+        if low in ACRONYM_EXCEPTIONS or len(word) == 2:
+            return word  # preserve
+        # else convert to Title‑case (handles hyphenated parts)
+        return "-".join(part.capitalize() for part in word.split("-"))
+
+    # Mixed / lower‑case tokens ➜ Title‑case (also handles hyphenated parts)
+    return "-".join(part.capitalize() for part in word.split("-"))
 
 
 def clean_company_name(name: str) -> str:
-    """Clean and normalise a single company name string."""
+    """Clean and normalise a company name while preserving '&' and hyphens."""
     if pd.isna(name):
         return ""
 
     name = str(name)
-    name = APOSTROPHE_RE.sub("", name)                      # remove apostrophes
+    name = APOSTROPHE_RE.sub("", name)
+    name = NON_ALNUM_RE.sub(" ", name)
+    name = MULTISPACE_RE.sub(" ", name).strip()
 
-    # Replace *spaced* ampersand with "and" ("A & B" → "A and B").
-    name = re.sub(r"\s&\s", " and ", name)
+    # Strip legal / professional suffixes (not touching standalone 'Co' here)
+    name = SUFFIX_RE.sub("", name).strip()
 
-    name = NON_ALNUM_RE.sub(" ", name)                     # drop punctuation except & and ‑
-    name = name.replace("-", " ")                         # hyphen → space
-    name = MULTISPACE_RE.sub(" ", name).strip()            # collapse whitespace
-    name = SUFFIX_RE.sub("", name).strip()                 # strip legal / prof suffixes
+    # Remove trailing 'Co' / 'Co.' unless preceded by '&'
+    if not re.search(r"&\s+co\.?$", name, re.IGNORECASE):
+        name = re.sub(r"\s+co\.?$", "", name, flags=re.IGNORECASE)
 
-    tokens = [_smart_case(tok) for tok in name.split()]
-    return " ".join(tokens)
+    tokens = name.split()
+    styled = [_smart_case(tok, i == 0) for i, tok in enumerate(tokens)]
+
+    # If trailing token is isolated '&', add back 'Co'
+    if styled and styled[-1] == '&':
+        styled.append('Co')
+
+    return " ".join(styled)
 
 
 # -----------------------------------------------------------
@@ -70,16 +98,16 @@ def clean_company_name(name: str) -> str:
 
 def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
     known, out = [], []
-    for n in series:
-        if not n:
-            out.append(n)
+    for value in series:
+        if not value:
+            out.append(value)
             continue
-        match = process.extractOne(n, known, scorer=fuzz.token_set_ratio)
+        match = process.extractOne(value, known, scorer=fuzz.token_set_ratio)
         if match and match[1] >= threshold:
             canonical = match[0]
         else:
-            canonical = n
-            known.append(n)
+            canonical = value
+            known.append(value)
         out.append(canonical)
     return pd.Series(out, index=series.index)
 
@@ -87,6 +115,7 @@ def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
 # -----------------------------------------------------------
 # Streamlit Interface
 # -----------------------------------------------------------
+
 st.set_page_config(page_title="CSV Company Name Cleaner", page_icon="🧹", layout="centered")
 
 st.title("🧹 CSV Company Name Cleaner")
@@ -95,13 +124,10 @@ st.markdown(
     """
 Upload a CSV, pick the column with company names, and download a cleaned version.
 
-**Key rules**
-* Apostrophes removed (*Danny's → Dannys*)
-* Plain **&** kept inside tokens (so *H&H* stays *H&H*). Only " & " with spaces becomes **and**
-* Legal/prof suffixes (Inc, LLC, DDS, MD, P A …) stripped
-* Punctuation removed, hyphens → space
-* Smart casing keeps acronyms / state codes upper‑case
-* Optional fuzzy de‑duplication (RapidFuzz)
+**Key updates**
+* Only 2‑letter codes or whitelisted acronyms stay all‑caps—so *OLD*, *MFG*, *AIR* now title‑case.
+* Stop‑words (of, and, for…) lowercase mid‑name.
+* Everything else (hyphen, ampersand, suffix removal) unchanged.
 """
 )
 
@@ -142,7 +168,6 @@ if uploaded is not None:
     st.markdown(
         """
 ---
-Need another edge‑case handled? Add it to `LEGAL_SUFFIX_PATTERNS`, adapt the ampersand
-rule, or ping me and I’ll patch it!
+More edge‑cases? Add the acronym to `ACRONYM_EXCEPTIONS` or tweak logic and redeploy.
 """
     )
