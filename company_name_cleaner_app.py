@@ -8,14 +8,18 @@ from rapidfuzz import fuzz, process
 # Cleaning utilities
 # -----------------------------------------------------------
 LEGAL_SUFFIX_PATTERNS = [
+    # Common corporate/legal endings
     r'incorporated', r'inc\.?',
     r'llc', r'l\.l\.c\.?',
-    r'company', r'corp\.?', r'corporation',
+    r'company', r'co\.?',
+    r'corp\.?', r'corporation',
     r'limited', r'ltd\.?', r'plc',
     r'gmbh', r's\.a\.?', r'bv', r'b\.v\.?', r'ag',
     # Professional / medical markers
     r'dds', r'dmd',
-    r'p\.a\.?', r'p\s*a', r'pa',
+    r'p\.c\.?', r'p\s*c', r'pc',   # professional corporation
+    r'p\.a\.?', r'p\s*a', r'pa',    # professional association
+    r'llp', r'l\.l\.p\.?',         # limited liability partnership
     r'm\.d\.?', r'm\s*d', r'md',
 ]
 
@@ -30,37 +34,37 @@ STATE_CODES = {
     'oh', 'ok', 'or', 'pa', 'ri', 'sc', 'sd', 'tn', 'tx', 'ut', 'vt', 'va', 'wa', 'wv', 'wi', 'wy'
 }
 
-STOPWORDS_LOWER = {
+STOPWORDS = {
     'of', 'and', 'the', 'for', 'in', 'on', 'at', 'with', 'to', 'from', 'by'
 }
 
-ACRONYM_EXCEPTIONS = {
-    'usa', 'bsn', 'ibm', 'uams', 'uapb', 'mri', 'ct'
+ACRONYM_WHITELIST = {
+    'usa', 'bsn', 'ibm', 'uams', 'uapb', 'mri', 'ct', 'ltb'  # custom acronyms stay uppercase
 }
 
 
-def _smart_case(word: str) -> str:
-    """Return a word in appropriate case.
+def _smart_case(word: str, first: bool) -> str:
+    """Return word with correct casing using custom rules.
 
-    * Always lowercase stop‑words (of, and, …) regardless of position.
-    * Preserve two‑letter state codes (AR, TX) and whitelisted acronyms.
-    * Everything else title‑cased, keeping hyphenated parts.
+    * Stop‑words lowercase **unless** they are the first token (keep title case for names like "The Barcode Group").
+    * Preserve two‑letter state codes and whitelisted acronyms in uppercase.
+    * Otherwise Title‑case (handling hyphens).
     """
     low = word.lower()
 
-    # Force stop‑words to lowercase everywhere
-    if low in STOPWORDS_LOWER:
-        return low
+    # Stop‑word logic
+    if low in STOPWORDS:
+        return word.capitalize() if first else low
 
-    # Preserve state abbreviations
+    # State abbreviations
     if len(word) == 2 and low in STATE_CODES:
         return word.upper()
 
-    # Preserve whitelisted acronyms (all‑caps tokens in the exceptions list)
-    if word.isupper() and low in ACRONYM_EXCEPTIONS:
+    # Whitelisted acronyms
+    if word.isupper() and low in ACRONYM_WHITELIST:
         return word
 
-    # Otherwise Title‑case, handling hyphenated compounds
+    # Default Title‑case (handle hyphenated parts)
     return "-".join(part.capitalize() for part in word.split("-"))
 
 
@@ -73,25 +77,23 @@ def clean_company_name(name: str) -> str:
     name = NON_ALNUM_RE.sub(" ", name)
     name = MULTISPACE_RE.sub(" ", name).strip()
 
-    # Strip legal / professional suffixes (not touching standalone 'Co' here)
     name = SUFFIX_RE.sub("", name).strip()
 
-    # Remove trailing 'Co' / 'Co.' unless preceded by '&'
+    # Remove trailing 'Co' unless preceded by '&'
     if not re.search(r"&\s+co\.?$", name, re.IGNORECASE):
         name = re.sub(r"\s+co\.?$", "", name, flags=re.IGNORECASE)
 
     tokens = name.split()
-    styled = [_smart_case(tok) for tok in tokens]
+    styled = [_smart_case(tok, i == 0) for i, tok in enumerate(tokens)]
 
-    # Restore '& Co' if we accidentally trimmed 'Co' after an ampersand
     if styled and styled[-1] == '&':
         styled.append('Co')
 
-    return " " . join(styled)
+    return " ".join(styled)
 
 
 # -----------------------------------------------------------
-# Fuzzy deduplication helper
+# Fuzzy de‑duplication helper
 # -----------------------------------------------------------
 
 def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
@@ -111,7 +113,7 @@ def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
 
 
 # -----------------------------------------------------------
-# Streamlit Interface
+# Streamlit Interface (unchanged)
 # -----------------------------------------------------------
 
 st.set_page_config(page_title="CSV Company Name Cleaner", page_icon="🧹", layout="centered")
@@ -120,11 +122,13 @@ st.title("🧹 CSV Company Name Cleaner")
 
 st.markdown(
     """
-Upload a CSV, pick the column with company names, and download a cleaned version.
+Upload a CSV, pick the column with company names, and download a cleaned file.
 
-**Latest fix**
-* Stop‑words (*of, and, the…*) now always remain lowercase—no more stray caps.
-* Other rules unchanged (ampersands/hyphens kept, suffixes removed, smart acronyms, optional fuzzy dedupe).
+* Hyphens and ampersands preserved (e.g., **Jan‑Pro**, **H&H**, **Eldredge & Clark**)
+* Legal/prof suffixes removed (Inc, LLC, LLP, PC, DDS, …)
+* Stop‑words lowercase inside the name but capitalised if first (The Barcode Group)
+* State codes and whitelisted acronyms stay uppercase (LTB, USA…)
+* **Optional fuzzy de‑duplication** to group near‑identical names into a *Canonical Company Name* column
 """
 )
 
@@ -141,13 +145,13 @@ if uploaded is not None:
     default_idx = next((i for i, c in enumerate(cols) if "company" in c.lower()), 0)
     col = st.selectbox("Column with company names", cols, index=default_idx)
 
-    use_fuzzy = st.checkbox("Fuzzy deduplicate similar names", value=False)
-    thresh = st.slider("Similarity threshold", 80, 100, 92, disabled=not use_fuzzy)
+    use_dedupe = st.checkbox("Apply fuzzy de‑duplication", value=False)
+    threshold = st.slider("Similarity threshold", 80, 100, 92, disabled=not use_dedupe)
 
     with st.spinner("Cleaning names…"):
         df["Cleaned Company Name"] = df[col].astype(str).map(clean_company_name)
-        if use_fuzzy:
-            df["Canonical Company Name"] = fuzzy_deduplicate(df["Cleaned Company Name"], threshold=thresh)
+        if use_dedupe:
+            df["Canonical Company Name"] = fuzzy_deduplicate(df["Cleaned Company Name"], threshold)
 
     st.success("✅ Cleaning complete!")
 
@@ -162,9 +166,4 @@ if uploaded is not None:
         mime="text/csv",
     )
 
-    st.markdown(
-        """
----
-Need more tweaks? Just ask and we’ll refine further.
-"""
-    )
+    st.markdown("---\nNeed more tweaks? Just ask and we’ll refine further.")
