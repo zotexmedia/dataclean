@@ -7,46 +7,60 @@ from rapidfuzz import fuzz, process
 # -----------------------------------------------------------
 # Cleaning utilities
 # -----------------------------------------------------------
+# Regex‑ready suffixes that should be cut from the end of names
 LEGAL_SUFFIX_PATTERNS = [
-    r'incorporated',
-    r'inc\.?',
-    r'llc',
-    r'l\.l\.c\.?',
-    r'company',
-    r'co\.?',
-    r'corp\.?',
-    r'corporation',
-    r'limited',
-    r'ltd\.?',
-    r'plc',
-    r'gmbh',
-    r's\.a\.?',
-    r'bv',
-    r'b\.v\.?',
-    r'ag',
+    r'incorporated', r'inc\.?',
+    r'llc', r'l\.l\.c\.?',
+    r'company', r'co\.?', r'corp\.?', r'corporation',
+    r'limited', r'ltd\.?', r'plc',
+    r'gmbh', r's\.a\.?', r'bv', r'b\.v\.?', r'ag',
+    # Professional / medical markers
+    r'dds', r'dmd',
+    r'p\.a\.?', r'p\s*a', r'pa',
+    r'm\.d\.?', r'm\s*d', r'md',
 ]
 
 SUFFIX_RE = re.compile(r"\s+(?:" + "|".join(LEGAL_SUFFIX_PATTERNS) + r")\s*$", re.IGNORECASE)
-NON_ALNUM_RE = re.compile(r"[^\w\s-]")
+# Keep ampersand (&) so tokens like "H&H" survive. Hyphen kept initially, stripped later.
+NON_ALNUM_RE = re.compile(r"[^\w\s&-]")
 MULTISPACE_RE = re.compile(r"\s{2,}")
 APOSTROPHE_RE = re.compile(r"[’']")
 
+STATE_CODES = {
+    'al', 'ak', 'az', 'ar', 'ca', 'co', 'ct', 'de', 'fl', 'ga', 'hi', 'id', 'il', 'in', 'ia', 'ks', 'ky',
+    'la', 'me', 'md', 'ma', 'mi', 'mn', 'ms', 'mo', 'mt', 'ne', 'nv', 'nh', 'nj', 'nm', 'ny', 'nc', 'nd',
+    'oh', 'ok', 'or', 'pa', 'ri', 'sc', 'sd', 'tn', 'tx', 'ut', 'vt', 'va', 'wa', 'wv', 'wi', 'wy'
+}
+
+
+def _smart_case(word: str) -> str:
+    """Return a word in a visually sensible case."""
+    if word.isupper():
+        return word
+    if len(word) == 2 and word.lower() in STATE_CODES:
+        return word.upper()
+    if len(word) <= 3 and word.isalpha():
+        return word.upper()
+    return word.title()
+
 
 def clean_company_name(name: str) -> str:
-    """Clean and standardise a single company name."""
+    """Clean and normalise a single company name string."""
     if pd.isna(name):
         return ""
 
     name = str(name)
-    name = APOSTROPHE_RE.sub("", name)           # Gilmer's → Gilmers
-    name = name.replace("&", " and ")            # & → and
-    name = NON_ALNUM_RE.sub(" ", name)            # drop punctuation (keep hyphen for now)
-    name = name.replace("-", " ")                # hyphen → space
-    name = MULTISPACE_RE.sub(" ", name).strip()   # collapse spaces
-    name = SUFFIX_RE.sub("", name).strip()        # strip legal suffixes
+    name = APOSTROPHE_RE.sub("", name)                      # remove apostrophes
 
-    # Title‑case while preserving acronyms (ALL‑CAPS words)
-    tokens = [t if t.isupper() else t.title() for t in name.split()]
+    # Replace *spaced* ampersand with "and" ("A & B" → "A and B").
+    name = re.sub(r"\s&\s", " and ", name)
+
+    name = NON_ALNUM_RE.sub(" ", name)                     # drop punctuation except & and ‑
+    name = name.replace("-", " ")                         # hyphen → space
+    name = MULTISPACE_RE.sub(" ", name).strip()            # collapse whitespace
+    name = SUFFIX_RE.sub("", name).strip()                 # strip legal / prof suffixes
+
+    tokens = [_smart_case(tok) for tok in name.split()]
     return " ".join(tokens)
 
 
@@ -55,10 +69,7 @@ def clean_company_name(name: str) -> str:
 # -----------------------------------------------------------
 
 def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
-    """Group near‑duplicate names using RapidFuzz token‑set ratio."""
-    known: list[str] = []
-    out: list[str] = []
-
+    known, out = [], []
     for n in series:
         if not n:
             out.append(n)
@@ -70,28 +81,26 @@ def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
             canonical = n
             known.append(n)
         out.append(canonical)
-
     return pd.Series(out, index=series.index)
 
 
 # -----------------------------------------------------------
 # Streamlit Interface
 # -----------------------------------------------------------
-
 st.set_page_config(page_title="CSV Company Name Cleaner", page_icon="🧹", layout="centered")
 
 st.title("🧹 CSV Company Name Cleaner")
 
 st.markdown(
     """
-Upload a CSV, choose the column containing company names, and download a cleaned file.
+Upload a CSV, pick the column with company names, and download a cleaned version.
 
-**Cleaning rules**
-* Apostrophes removed (*Gilmer's → Gilmers*)
-* Ampersand becomes **and**
-* Legal suffixes (Inc, LLC, Corp, …) dropped
-* Punctuation stripped, hyphens → space
-* Smart title‑casing (acronyms preserved)
+**Key rules**
+* Apostrophes removed (*Danny's → Dannys*)
+* Plain **&** kept inside tokens (so *H&H* stays *H&H*). Only " & " with spaces becomes **and**
+* Legal/prof suffixes (Inc, LLC, DDS, MD, P A …) stripped
+* Punctuation removed, hyphens → space
+* Smart casing keeps acronyms / state codes upper‑case
 * Optional fuzzy de‑duplication (RapidFuzz)
 """
 )
@@ -105,9 +114,9 @@ if uploaded is not None:
         st.error(f"❌ Could not read CSV: {e}")
         st.stop()
 
-    columns = df.columns.tolist()
-    default_idx = next((i for i, c in enumerate(columns) if "company" in c.lower()), 0)
-    col = st.selectbox("Column with company names", columns, index=default_idx)
+    cols = df.columns.tolist()
+    default_idx = next((i for i, c in enumerate(cols) if "company" in c.lower()), 0)
+    col = st.selectbox("Column with company names", cols, index=default_idx)
 
     use_fuzzy = st.checkbox("Fuzzy deduplicate similar names", value=False)
     thresh = st.slider("Similarity threshold", 80, 100, 92, disabled=not use_fuzzy)
@@ -122,9 +131,9 @@ if uploaded is not None:
     st.markdown("### Preview (first 25 rows)")
     st.dataframe(df.head(25))
 
-    csv_bytes = df.to_csv(index=False).encode("utf‑8")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download cleaned CSV",
+        "Download cleaned CSV",
         data=csv_bytes,
         file_name=f"cleaned_{uploaded.name}",
         mime="text/csv",
@@ -133,7 +142,7 @@ if uploaded is not None:
     st.markdown(
         """
 ---
-If you spot a suffix or pattern that isn't handled, just add it to
-`LEGAL_SUFFIX_PATTERNS` and redeploy — or ping me and I'll patch it!
+Need another edge‑case handled? Add it to `LEGAL_SUFFIX_PATTERNS`, adapt the ampersand
+rule, or ping me and I’ll patch it!
 """
     )
