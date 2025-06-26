@@ -5,114 +5,153 @@ import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz, process
 
-# -----------------------------
-# Utility ‑ Cleaning Functions
-# -----------------------------
-SUFFIXES = {
-    "inc", "inc.", "llc", "l.l.c.", "co", "co.", "corp", "corporation", "limited",
-    "ltd", "ltd.", "plc", "gmbh", "pte", "pty", "sa", "s.a.", "bv", "b.v.", "ag",
-}
+# -----------------------------------------------------------
+# Cleaning utilities
+# -----------------------------------------------------------
+LEGAL_SUFFIX_PATTERNS = [
+    r'incorporated',
+    r'inc\.?',
+    r'llc',
+    r'l\.l\.c\.?',
+    r'company',
+    r'co\.?',
+    r'corp\.?',
+    r'corporation',
+    r'limited',
+    r'ltd\.?',
+    r'plc',
+    r'gmbh',
+    r's\.a\.?',
+    r'bv',
+    r'b\.v\.?',
+    r'ag',
+]
 
-SPECIAL_CHARS_PATTERN = re.compile(r"[^\w\s]")
-MULTISPACE_PATTERN = re.compile(r"\s{2,}")
+SUFFIX_RE = re.compile(r"\s+(?:" + "|".join(LEGAL_SUFFIX_PATTERNS) + r")\s*$", flags=re.IGNORECASE)
+# apostrophes are handled separately so they don't turn into spaces
+NON_ALNUM_RE = re.compile(r"[^\w\s-]")  # keep hyphens initially, strip later
+MULTISPACE_RE = re.compile(r"\s{2,}")
+APOSTROPHE_RE = re.compile(r"[’']")
 
 
 def clean_company_name(name: str) -> str:
-    """Basic deterministic cleaning for a single company name."""
+    """Return a normalised company name with legal suffixes and punctuation removed.
+
+    Steps:
+    1. Remove apostrophes ("Gilmer's" -> "Gilmers")
+    2. Replace ampersands with textual "and"
+    3. Remove all non‑alphanumeric chars (we keep hyphens for now)
+    4. Convert hyphens to space to merge words
+    5. Collapse multiple spaces and strip
+    6. Strip legal suffixes (Inc, LLC, etc.)
+    7. Smart title‑case while preserving acronyms (ALL‑CAPS words)
+    """
     if pd.isna(name):
         return ""
 
-    # Normalize whitespace, strip special chars, lowercase
-    name = SPECIAL_CHARS_PATTERN.sub(" ", name.lower())
-    name = MULTISPACE_PATTERN.sub(" ", name).strip()
+    name = str(name)
+    # 1. Apostrophes -> remove (don't introduce space)
+    name = APOSTROPHE_RE.sub("", name)
+    # 2. & -> and (keeps meaning, better dedupe)
+    name = name.replace("&", " and ")
+    # 3. Remove punctuation except hyphen
+    name = NON_ALNUM_RE.sub(" ", name)
+    # 4. Hyphen -> space
+    name = name.replace("-", " ")
+    # 5. Collapse spaces
+    name = MULTISPACE_RE.sub(" ", name).strip()
+    # 6. Strip legal suffixes at end
+    name = SUFFIX_RE.sub("", name).strip()
+    # 7. Title‑case preserving acronyms
+    tokens = [(t if t.isupper() else t.title()) for t in name.split()]
+    return " ".join(tokens)
 
-    # Remove common legal suffixes
-    words = [w for w in name.split() if w not in SUFFIXES]
 
-    # Re‑title‑case but keep uppercase words (e.g., IBM)
-    cleaned = " ".join(word.upper() if word.isupper() else word.title() for word in words)
-    return cleaned
+# -----------------------------------------------------------
+# Fuzzy deduplication helper (RapidFuzz ≥ 3.x)
+# -----------------------------------------------------------
 
+def fuzzy_deduplicate(series: pd.Series, threshold: int = 92) -> pd.Series:
+    """Map near‑duplicate names to a single canonical representative.
 
-# -----------------------------
-# Fuzzy Deduplication Helpers
-# -----------------------------
+    Uses token‑set ratio; threshold default 92 (tunable via slider).
+    """
+    known: list[str] = []
+    output: list[str] = []
 
-def fuzzy_deduplicate(names: pd.Series, threshold: int = 90) -> pd.Series:
-    """Group names that are similar above the threshold and assign the canonical form."""
-    canonical_map = {}
-    cleaned_list = names.tolist()
-
-    for idx, original in enumerate(cleaned_list):
-        if idx in canonical_map:  # already assigned
+    for name in series:
+        if not name:
+            output.append(name)
             continue
 
-        # Find similar names
-        matches = process.extractBests(original, cleaned_list, scorer=fuzz.token_set_ratio, score_cutoff=threshold)
-        for match_name, _score, match_idx in matches:
-            canonical_map[match_idx] = original  # Assign canonical representative
+        match = process.extractOne(name, known, scorer=fuzz.token_set_ratio)
+        if match and match[1] >= threshold:
+            canonical = match[0]
+        else:
+            canonical = name
+            known.append(name)
+        output.append(canonical)
 
-    # Build new series with canonical names
-    canonical_series = pd.Series([canonical_map.get(i, name) for i, name in enumerate(cleaned_list)])
-    return canonical_series
+    return pd.Series(output, index=series.index)
 
 
-# -----------------------------
-# Streamlit Interface
-# -----------------------------
+# -----------------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------------
 st.set_page_config(page_title="CSV Company Name Cleaner", page_icon="🧹", layout="centered")
+
 st.title("🧹 CSV Company Name Cleaner")
+
 st.markdown(
     """
-This tool cleans and standardises *Company Name* fields in your CSV files.
-- **Legal suffix removal** (Inc, LLC, Corp, …)
-- **Special‑character stripping**
-- **Whitespace / casing fixes**
-- **Optional fuzzy deduplication** using RapidFuzz (token‑set‑ratio)
+Upload a CSV, pick the column that holds company names, and download a cleaned
+version.
+
+**Cleaning rules**
+* Apostrophes removed ("Gilmer's" → "Gilmers")
+* Ampersand becomes "and" (better matching)
+* Legal suffixes (Inc, LLC, Corp, …) dropped
+* Punctuation / weird characters stripped, hyphens → space
+* Names smart‑title‑cased (acronyms preserved)
+* *Optional* fuzzy deduplication (RapidFuzz)
     """
 )
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-if uploaded is not None:
+if uploaded:
     try:
         df = pd.read_csv(uploaded)
-    except Exception:
-        st.error("❌ Could not read the CSV. Please ensure it's a valid file.")
+    except Exception as e:
+        st.error(f"❌ Could not read CSV: {e}")
         st.stop()
 
-    # Let user select the column containing company names
     cols = df.columns.tolist()
-    default_col = next((c for c in cols if "company" in c.lower()), cols[0])
-    name_col = st.selectbox("Select the column with company names", cols, index=cols.index(default_col))
+    default_idx = next((i for i, c in enumerate(cols) if "company" in c.lower()), 0)
+    col_choice = st.selectbox("Column with company names", cols, index=default_idx)
 
-    st.markdown("### Cleaning parameters")
-    do_fuzzy = st.checkbox("Apply fuzzy deduplication", value=False)
-    threshold = st.slider("Similarity threshold (higher = stricter)", 70, 100, 90, disabled=not do_fuzzy)
+    fuzzy_opt = st.checkbox("Fuzzy deduplicate similar names", value=False)
+    threshold = st.slider("Similarity threshold", 80, 100, 92, disabled=not fuzzy_opt)
 
-    # Perform cleaning
-    with st.spinner("Cleaning names ..."):
-        df["Cleaned Company Name"] = df[name_col].astype(str).apply(clean_company_name)
-        if do_fuzzy:
+    with st.spinner("Cleaning names…"):
+        df["Cleaned Company Name"] = df[col_choice].astype(str).map(clean_company_name)
+        if fuzzy_opt:
             df["Canonical Company Name"] = fuzzy_deduplicate(df["Cleaned Company Name"], threshold=threshold)
 
     st.success("✅ Cleaning complete!")
 
-    # Show preview
     st.markdown("### Preview (first 25 rows)")
     st.dataframe(df.head(25))
 
-    # Download button
-    out_file = Path("cleaned_" + uploaded.name)
-    df.to_csv(out_file, index=False)
+    csv_data = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download cleaned CSV",
-        data=out_file.read_bytes(),
-        file_name=out_file.name,
+        "Download cleaned CSV",
+        data=csv_data,
+        file_name=f"cleaned_{uploaded.name}",
         mime="text/csv",
     )
 
-    st.markdown("---")
     st.markdown(
-        "#### Tips:\n- If you enable fuzzy deduplication, similar names (≥ threshold) map to the first appearance.\n- You can re‑upload the cleaned file for additional passes if needed."
+        "---\nIf you spot any suffix or pattern that isn't getting cleaned, add it to
+        `LEGAL_SUFFIX_PATTERNS` and redeploy—or let me know and I'll patch it!"
     )
